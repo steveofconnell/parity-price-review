@@ -511,7 +511,7 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
                                 for x in edges:
                                     cx = int(x * col_scale)
                                     draw.line([(cx, 0), (cx, crop_h)],
-                                              fill='#457b9d', width=1)
+                                              fill='#e63946', width=3)
 
                         hl_top = row_top - ct - 2
                         hl_bottom = row_bottom - ct + 2
