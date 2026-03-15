@@ -1,0 +1,6 @@
+streamlit
+pandas
+Pillow
+gspread
+google-auth
+requests
