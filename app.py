@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
 Streamlit app for reviewing OCR-extracted parity price data.
-Cloud deployment version — images from GCS, credentials from Streamlit secrets.
+
+Shows the scanned parity table page alongside extracted values.
+User can confirm, correct, or flag each extraction.
+Corrections are saved to a JSON file and can be applied to produce a corrected CSV.
+
+Usage:
+    streamlit run review_app.py
+
+Pre-requisite: run generate_page_images.py first to create page images.
+If images are missing, the app will generate them on-the-fly (slower).
 """
 
-import json
 import io
+import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -17,12 +27,19 @@ from PIL import Image, ImageDraw
 SCRIPT_DIR = Path(__file__).parent
 EXTRACTED_CSV = SCRIPT_DIR / "extracted_pct_of_parity.csv"
 COLUMN_POSITIONS_FILE = SCRIPT_DIR / "extracted_pct_of_parity_column_positions.json"
+CORRECTIONS_FILE = SCRIPT_DIR / "corrections.json"
+CORRECTED_CSV = SCRIPT_DIR / "extracted_pct_of_parity_corrected.csv"
 
 # Google Cloud Storage base URL for page images
 GCS_IMAGE_BASE = "https://storage.googleapis.com/parity-price-review-images"
 
 # Google Sheets config
+GSHEET_CREDENTIALS = None  # use st.secrets in cloud
 GSHEET_ID = '1KyWnEIeOqZDn394jWQB74bh2cI7A1moMZ3KGEtUjbz4'
+GSHEET_HEADERS = ['key', 'source_pdf', 'commodity', 'date',
+                  'pct_of_parity', 'original_pct', 'pct_footnote',
+                  'parity_price', 'original_parity_price', 'parity_footnote',
+                  'status', 'note', 'reviewer', 'timestamp']
 
 
 # ---------------------------------------------------------------------------
@@ -36,21 +53,13 @@ def get_gsheet_connection():
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-        # Try Streamlit secrets first, then local file
         if 'gcp_service_account' in st.secrets:
             creds = Credentials.from_service_account_info(
                 dict(st.secrets['gcp_service_account']),
                 scopes=['https://www.googleapis.com/auth/spreadsheets']
             )
         else:
-            # Local fallback
-            creds_path = Path('/Users/soconn8/Dropbox/Personal/tokens/digitizeparitypriceseries-36b3d2770be6.json')
-            if not creds_path.exists():
-                return None
-            creds = Credentials.from_service_account_file(
-                str(creds_path),
-                scopes=['https://www.googleapis.com/auth/spreadsheets']
-            )
+            return None
         gc = gspread.authorize(creds)
         sheet = gc.open_by_key(GSHEET_ID)
         ws = sheet.sheet1
@@ -82,6 +91,7 @@ def load_corrections_from_gsheet(ws):
             'commodity': row.get('commodity', ''),
             'date': row.get('date', ''),
         }
+        # Convert numeric fields
         for field in ['pct_of_parity', 'original_pct']:
             try:
                 corrections[key][field] = int(corrections[key][field])
@@ -98,16 +108,18 @@ def load_corrections_from_gsheet(ws):
 
 def save_corrections_to_gsheet(ws, corrections, reviewer=''):
     """Write corrections to Google Sheet. Updates existing rows, appends new ones."""
-    existing = ws.col_values(1)
+    # Get existing keys and their row numbers
+    existing = ws.col_values(1)  # column A = keys
     key_to_row = {k: i + 1 for i, k in enumerate(existing) if k}
 
-    updates = []
-    appends = []
+    updates = []  # (row_num, row_data) for batch update
+    appends = []  # new rows to append
+
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     for key, c in corrections.items():
         if c.get('status', 'unreviewed') == 'unreviewed':
-            continue
+            continue  # don't write unreviewed entries
         row_data = [
             key,
             c.get('source_pdf', ''),
@@ -115,8 +127,10 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
             c.get('date', ''),
             c.get('pct_of_parity', ''),
             c.get('original_pct', ''),
+            c.get('pct_footnote', ''),
             c.get('parity_price', '') if c.get('parity_price') is not None else '',
             c.get('original_parity_price', '') if c.get('original_parity_price') is not None else '',
+            c.get('parity_footnote', ''),
             c.get('status', ''),
             c.get('note', ''),
             reviewer or c.get('reviewer', ''),
@@ -128,15 +142,17 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
         else:
             appends.append(row_data)
 
+    # Batch update existing rows
     if updates:
         batch = []
         for row_num, row_data in updates:
             batch.append({
-                'range': f'A{row_num}:L{row_num}',
+                'range': f'A{row_num}:N{row_num}',
                 'values': [row_data],
             })
         ws.batch_update(batch)
 
+    # Append new rows
     if appends:
         ws.append_rows(appends, value_input_option='RAW')
 
@@ -150,9 +166,11 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
 @st.cache_data
 def load_data(_cache_buster=None):
     df = pd.read_csv(EXTRACTED_CSV)
+    # Ensure types
     df['pct_of_parity'] = pd.to_numeric(df['pct_of_parity'], errors='coerce')
     df['source_page'] = pd.to_numeric(df['source_page'], errors='coerce')
     df['parity_price_ocr'] = pd.to_numeric(df['parity_price_ocr'], errors='coerce')
+    # Optional columns (may not exist in older CSV versions)
     for col in ['pct_footnote', 'parity_footnote', 'bbox_left', 'bbox_top',
                 'bbox_right', 'bbox_bottom', 'bbox_dpi']:
         if col in df.columns:
@@ -161,13 +179,16 @@ def load_data(_cache_buster=None):
 
 
 def load_corrections():
-    """Load corrections from Google Sheet."""
+    """Load corrections from Google Sheet if available, else local JSON."""
     ws = get_gsheet_connection()
     if ws:
         try:
             return load_corrections_from_gsheet(ws)
         except Exception as e:
-            st.sidebar.warning(f"Sheet read failed: {e}")
+            st.sidebar.warning(f"Sheet read failed, using local: {e}")
+    if CORRECTIONS_FILE.exists():
+        with open(CORRECTIONS_FILE) as f:
+            return json.load(f)
     return {}
 
 
@@ -180,7 +201,12 @@ def load_column_positions():
 
 
 def save_corrections(corrections):
-    """Save corrections to Google Sheet."""
+    """Save corrections to Google Sheet and local JSON."""
+    # Always save local backup
+    with open(CORRECTIONS_FILE, 'w') as f:
+        json.dump(corrections, f, indent=2)
+
+    # Save to Google Sheet
     ws = get_gsheet_connection()
     if ws:
         try:
@@ -188,7 +214,7 @@ def save_corrections(corrections):
             n_updated, n_appended = save_corrections_to_gsheet(ws, corrections, reviewer)
             return n_updated, n_appended
         except Exception as e:
-            st.sidebar.warning(f"Sheet write failed: {e}")
+            st.sidebar.warning(f"Sheet write failed (saved locally): {e}")
     return 0, 0
 
 
@@ -198,7 +224,7 @@ def make_key(row):
 
 
 # ---------------------------------------------------------------------------
-# Image handling (from GCS)
+# Image handling
 # ---------------------------------------------------------------------------
 
 @st.cache_data(ttl=3600)
@@ -225,6 +251,7 @@ def get_highlighted_image(page_img, rows_df):
     img = page_img.copy()
     draw = ImageDraw.Draw(img)
 
+    # Color per commodity for visual distinction
     colors = {
         'wheat': '#e63946', 'corn': '#457b9d', 'cotton': '#2a9d8f',
         'rice': '#e9c46a', 'tobacco': '#f4a261', 'milk': '#264653',
@@ -238,16 +265,46 @@ def get_highlighted_image(page_img, rows_df):
     for _, row in rows_df.iterrows():
         if pd.isna(row.get('bbox_left')):
             continue
+
+        # Scale from extraction DPI (400) to image DPI (200)
         extraction_dpi = row.get('bbox_dpi', 400)
         scale = 200.0 / extraction_dpi
+
         left = int(row['bbox_left'] * scale)
         top = int(row['bbox_top'] * scale) - 3
         right = int(row['bbox_right'] * scale)
         bottom = int(row['bbox_bottom'] * scale) + 3
+
         color = colors.get(row['commodity'], '#ff0000')
         draw.rectangle([left, top, right, bottom], outline=color, width=2)
 
     return img
+
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def export_corrected_csv(df, corrections):
+    """Apply corrections to the original data and write a corrected CSV."""
+    corrected = df.copy()
+    applied = 0
+    for idx, row in corrected.iterrows():
+        key = make_key(row)
+        if key in corrections:
+            c = corrections[key]
+            if c.get('status') in ('confirmed', 'corrected'):
+                corrected.at[idx, 'pct_of_parity'] = c['pct_of_parity']
+                if c.get('parity_price') is not None:
+                    corrected.at[idx, 'parity_price_ocr'] = c['parity_price']
+                corrected.at[idx, 'confidence'] = 'reviewed'
+                applied += 1
+            elif c.get('status') == 'rejected':
+                corrected.at[idx, 'confidence'] = 'rejected'
+                applied += 1
+    corrected.to_csv(CORRECTED_CSV, index=False)
+    return applied
 
 
 # ---------------------------------------------------------------------------
@@ -258,19 +315,22 @@ def main():
     st.set_page_config(layout="wide", page_title="Parity Price OCR Review")
     st.title("Parity Price OCR Review")
 
+    # Use CSV modification time as cache key to auto-reload when data changes
     csv_mtime = EXTRACTED_CSV.stat().st_mtime if EXTRACTED_CSV.exists() else 0
     df = load_data(_cache_buster=csv_mtime)
 
+    # Use session state for corrections so edits persist across reruns
     if 'corrections' not in st.session_state:
         st.session_state.corrections = load_corrections()
     corrections = st.session_state.corrections
 
     # ---- Sidebar ----
+    # ---- Reviewer name ----
     ws = get_gsheet_connection()
     if ws:
         st.sidebar.success("Connected to Google Sheets")
     else:
-        st.sidebar.error("Google Sheets not connected")
+        st.sidebar.info("Using local storage (no Google Sheets)")
     st.session_state.reviewer_name = st.sidebar.text_input(
         "Your name (for attribution)",
         value=st.session_state.get('reviewer_name', ''),
@@ -324,9 +384,20 @@ def main():
     st.sidebar.progress(min(n_reviewed / max(total, 1), 1.0))
     st.sidebar.markdown(f"**Showing:** {len(filtered)} rows")
 
-    # ---- Download ----
+    # ---- Export ----
+    # ---- Save / Export / Download ----
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**Export**")
+    st.sidebar.markdown("**Save & Export**")
+
+    if st.sidebar.button("Save corrections to disk"):
+        save_corrections(corrections)
+        st.sidebar.success("Saved!")
+
+    if st.sidebar.button("Export corrected CSV"):
+        n = export_corrected_csv(df, corrections)
+        st.sidebar.success(f"Exported {n} corrections to\n{CORRECTED_CSV.name}")
+
+    # Download corrections JSON
     corrections_json = json.dumps(corrections, indent=2)
     st.sidebar.download_button(
         "Download corrections JSON",
@@ -334,6 +405,43 @@ def main():
         file_name="corrections.json",
         mime="application/json",
     )
+
+    # Download corrected CSV
+    if st.sidebar.button("Generate & download corrected CSV"):
+        n = export_corrected_csv(df, corrections)
+        if CORRECTED_CSV.exists():
+            with open(CORRECTED_CSV) as f:
+                csv_data = f.read()
+            st.sidebar.download_button(
+                "Download CSV",
+                data=csv_data,
+                file_name="extracted_pct_of_parity_corrected.csv",
+                mime="text/csv",
+                key="dl_csv",
+            )
+
+    # Upload corrections (resume previous work)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Load previous work**")
+    uploaded = st.sidebar.file_uploader(
+        "Upload corrections JSON",
+        type="json",
+        help="Upload a previously downloaded corrections.json to resume work"
+    )
+    if uploaded is not None:
+        try:
+            uploaded_corrections = json.loads(uploaded.read())
+            # Merge: uploaded values override existing
+            merged_count = 0
+            for k, v in uploaded_corrections.items():
+                if k not in corrections or v.get('status') != 'unreviewed':
+                    corrections[k] = v
+                    merged_count += 1
+            save_corrections(corrections)
+            st.sidebar.success(f"Loaded {merged_count} corrections")
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Error loading file: {e}")
 
     # ---- Summary stats ----
     st.sidebar.markdown("---")
@@ -361,6 +469,7 @@ def render_by_pdf(filtered, corrections):
     """Show one PDF at a time with all its commodity extractions."""
     pdfs = sorted(filtered['source_pdf'].unique())
 
+    # Navigation
     col_nav1, col_nav2, col_nav3 = st.columns([1, 3, 1])
     if 'pdf_idx' not in st.session_state:
         st.session_state.pdf_idx = 0
@@ -386,6 +495,7 @@ def render_by_pdf(filtered, corrections):
 
     current_pdf = pdfs[st.session_state.pdf_idx]
     pdf_data = filtered[filtered['source_pdf'] == current_pdf]
+    # Sort by vertical position on page (order they appear in the PDF)
     if 'bbox_top' in pdf_data.columns and pdf_data['bbox_top'].notna().any():
         pdf_data = pdf_data.sort_values('bbox_top')
     else:
@@ -397,24 +507,26 @@ def render_by_pdf(filtered, corrections):
 
     st.caption(f"{len(pdf_data)} commodities extracted")
 
+    # Load column positions for this PDF
     all_col_positions = load_column_positions()
     col_positions = all_col_positions.get(current_pdf)
 
+    # Each commodity: crop at full width, then form below it
     render_commodity_forms(pdf_data, corrections, prefix="pdf",
                            page_img=page_img, col_positions=col_positions)
 
-    # Bulk save buttons
+    # Save button
     st.divider()
-    col_bulk1, col_bulk2 = st.columns(2)
-
-    def _apply_pending_and_save(advance=False):
+    if st.button("Save & next →", key="bulk_save_next", type="primary"):
         pending = st.session_state.get('pending_edits', {})
         for k, edit in pending.items():
             corrections[k] = {
                 'pct_of_parity': edit['pct_of_parity'],
                 'original_pct': edit['original_pct'],
+                'pct_footnote': edit.get('pct_footnote', ''),
                 'parity_price': edit['parity_price'],
                 'original_parity_price': edit['original_parity_price'],
+                'parity_footnote': edit.get('parity_footnote', ''),
                 'status': edit['status'],
                 'source_pdf': edit['source_pdf'],
                 'commodity': edit['commodity'],
@@ -424,20 +536,11 @@ def render_by_pdf(filtered, corrections):
         save_corrections(corrections)
         st.session_state.pending_edits = {}
         st.session_state.corrections = load_corrections()
-        if advance and st.session_state.pdf_idx < len(pdfs) - 1:
+        if st.session_state.pdf_idx < len(pdfs) - 1:
             st.session_state.pdf_idx += 1
+        st.rerun()
 
-    with col_bulk1:
-        if st.button("Save this page", key="bulk_save"):
-            _apply_pending_and_save()
-            st.success(f"Saved {len(pdf_data)} values")
-            st.rerun()
-    with col_bulk2:
-        if st.button("Save & advance →", key="bulk_save_next"):
-            _apply_pending_and_save(advance=True)
-            st.rerun()
-
-    # Full page image at the bottom
+    # Full page image at the bottom for reference
     if page_img:
         st.subheader("Full page")
         highlighted = get_highlighted_image(page_img, pdf_data)
@@ -452,16 +555,26 @@ def render_by_commodity(filtered, corrections):
     comm_data = filtered[filtered['commodity'] == selected].sort_values('date')
     st.markdown(f"**{len(comm_data)} observations** for {selected}")
 
+    # Quick time-series view
     if len(comm_data) > 1:
         chart_data = comm_data[['date', 'pct_of_parity']].set_index('date')
         st.line_chart(chart_data, height=200)
 
+    # Editable table
     render_commodity_forms(comm_data, corrections, prefix="comm")
 
 
 def render_commodity_forms(data, corrections, prefix="", page_img=None,
                            col_positions=None):
-    """Render editable forms for a set of rows."""
+    """Render editable forms for a set of rows.
+
+    Layout per commodity (optimized for keyboard tabbing):
+        [Flag checkbox] [Note checkbox → text if checked] [Parity $] [% of parity]
+
+    No individual save buttons — all edits collected and saved via
+    bulk buttons at the bottom of the page.
+    """
+    # Collect edits in session state so bulk save can access them
     if 'pending_edits' not in st.session_state:
         st.session_state.pending_edits = {}
 
@@ -470,6 +583,7 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
         existing = corrections.get(key, {})
         current_status = existing.get('status', 'unreviewed')
 
+        # Status indicator
         status_icons = {
             'unreviewed': '⬜',
             'confirmed': '✅',
@@ -529,25 +643,28 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
             # Top row: [spacer] [Parity $] [% parity]
             c_spacer, c_par, c_pct = st.columns([33, 7, 7])
 
+            # Format date as "Jan. 1971" etc.
+            month_abbrs = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',
+                           7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
+            try:
+                yr, mo = str(row['date']).split('-')
+                date_label = f"{month_abbrs[int(mo)]}. {yr}"
+            except (ValueError, KeyError):
+                date_label = str(row['date'])
+
+            par_fn = row.get('parity_footnote', None)
+            pct_fn = row.get('pct_footnote', None)
+
             with c_par:
-                par_fn = row.get('parity_footnote', None)
-                month_abbrs = {1:'Jan',2:'Feb',3:'Mar',4:'Apr',5:'May',6:'Jun',
-                               7:'Jul',8:'Aug',9:'Sep',10:'Oct',11:'Nov',12:'Dec'}
-                try:
-                    yr, mo = str(row['date']).split('-')
-                    date_label = f"{month_abbrs[int(mo)]}. {yr}"
-                except (ValueError, KeyError):
-                    date_label = str(row['date'])
-                par_label = f"Parity $ ({date_label})"
-                if pd.notna(par_fn) if hasattr(pd, 'notna') else par_fn is not None:
-                    par_label = f"Parity $ ({date_label}, fn {int(par_fn)}/)"
                 par_display = f"{parity_ocr:.2f}" if pd.notna(parity_ocr) else ""
                 par_display = existing.get('parity_price', par_display)
                 par_str = st.text_input(
-                    par_label,
+                    f"Parity $ ({date_label})",
                     value=str(par_display),
                     key=f"{prefix}_par_{key}_{row_idx}",
                 )
+                if pd.notna(par_fn):
+                    st.caption(f"footnote: {int(par_fn)}/")
                 try:
                     new_par = float(par_str) if par_str.strip() else None
                 except ValueError:
@@ -555,15 +672,13 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
 
             with c_pct:
                 display_val = existing.get('pct_of_parity', orig_val)
-                pct_fn = row.get('pct_footnote', None)
-                fn_label = f"% of parity ({date_label})"
-                if pd.notna(pct_fn) if hasattr(pd, 'notna') else pct_fn is not None:
-                    fn_label = f"% parity ({date_label}, fn {int(pct_fn)}/)"
                 pct_str = st.text_input(
-                    fn_label,
+                    f"% of parity ({date_label})",
                     value=str(int(display_val)),
                     key=f"{prefix}_pct_{key}_{row_idx}",
                 )
+                if pd.notna(pct_fn):
+                    st.caption(f"footnote: {int(pct_fn)}/")
                 try:
                     new_pct = int(pct_str)
                 except ValueError:
@@ -603,16 +718,19 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
             elif value_changed:
                 new_status = 'corrected'
             elif current_status in ('confirmed', 'corrected'):
-                new_status = current_status
+                new_status = current_status  # preserve existing review
             else:
-                new_status = 'confirmed'
+                new_status = 'confirmed'  # will be set on bulk save
 
+            # Store pending edit (used by bulk save)
             orig_par = float(parity_ocr) if pd.notna(parity_ocr) else None
             st.session_state.pending_edits[key] = {
                 'pct_of_parity': new_pct,
                 'original_pct': orig_val,
+                'pct_footnote': int(pct_fn) if pd.notna(pct_fn) else '',
                 'parity_price': new_par,
                 'original_parity_price': orig_par,
+                'parity_footnote': int(par_fn) if pd.notna(par_fn) else '',
                 'status': new_status,
                 'source_pdf': row['source_pdf'],
                 'commodity': row['commodity'],
