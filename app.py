@@ -527,7 +527,7 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
             parity_ocr = row.get('parity_price_ocr', None)
 
             # Top row: [spacer] [Parity $] [% parity]
-            c_spacer, c_par, c_pct = st.columns([5, 1, 1])
+            c_spacer, c_par, c_pct = st.columns([7, 2, 2])
 
             with c_par:
                 par_fn = row.get('parity_footnote', None)
@@ -570,7 +570,7 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
                     new_pct = orig_val
 
             # Bottom row: [spacer] [Flag] [Note]
-            c_spacer2, c_flag, c_note = st.columns([5, 1, 1])
+            c_spacer2, c_flag, c_note = st.columns([7, 2, 2])
 
             with c_flag:
                 is_flagged = current_status == 'flagged'
