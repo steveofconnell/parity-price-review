@@ -110,20 +110,27 @@ def load_corrections_from_gsheet(ws):
     return corrections
 
 
-def save_corrections_to_gsheet(ws, corrections, reviewer=''):
-    """Write corrections to Google Sheet. Updates existing rows, appends new ones."""
+def save_pending_to_gsheet(ws, pending_edits, reviewer=''):
+    """Write only the pending edits to Google Sheet. Does not touch other rows.
+
+    This avoids race conditions: each reviewer writes only the rows they
+    just reviewed, rather than overwriting the entire sheet.
+    """
+    if not pending_edits:
+        return 0, 0
+
     # Get existing keys and their row numbers
     existing = ws.col_values(1)  # column A = keys
     key_to_row = {k: i + 1 for i, k in enumerate(existing) if k}
 
-    updates = []  # (row_num, row_data) for batch update
-    appends = []  # new rows to append
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    updates = []
+    appends = []
 
-    for key, c in corrections.items():
+    for key, c in pending_edits.items():
         if c.get('status', 'unreviewed') == 'unreviewed':
-            continue  # don't write unreviewed entries
+            continue
         row_data = [
             key,
             c.get('source_pdf', ''),
@@ -137,7 +144,7 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
             c.get('parity_footnote', ''),
             c.get('status', ''),
             c.get('note', ''),
-            reviewer or c.get('reviewer', ''),
+            reviewer,
             timestamp,
         ]
         if key in key_to_row:
@@ -146,7 +153,6 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
         else:
             appends.append(row_data)
 
-    # Batch update existing rows
     if updates:
         batch = []
         for row_num, row_data in updates:
@@ -156,7 +162,6 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
             })
         ws.batch_update(batch)
 
-    # Append new rows
     if appends:
         ws.append_rows(appends, value_input_option='RAW')
 
@@ -344,18 +349,24 @@ def load_column_positions():
     return {}
 
 
-def save_corrections(corrections):
-    """Save corrections to Google Sheet and local JSON."""
-    # Always save local backup
+def save_corrections(corrections, pending_edits=None):
+    """Save pending edits to Google Sheet, then reload all corrections.
+
+    Only the rows in pending_edits are written to the sheet, avoiding
+    race conditions between concurrent reviewers. The full corrections
+    dict is saved locally as a backup.
+    """
+    # Always save local backup of full state
     with open(CORRECTIONS_FILE, 'w') as f:
         json.dump(corrections, f, indent=2)
 
-    # Save to Google Sheet
+    # Write only pending edits to Google Sheet
     ws = get_gsheet_connection()
-    if ws:
+    if ws and pending_edits:
         try:
             reviewer = st.session_state.get('reviewer_name', '')
-            n_updated, n_appended = save_corrections_to_gsheet(ws, corrections, reviewer)
+            n_updated, n_appended = save_pending_to_gsheet(
+                ws, pending_edits, reviewer)
             return n_updated, n_appended
         except Exception as e:
             st.sidebar.warning(f"Sheet write failed (saved locally): {e}")
@@ -723,8 +734,10 @@ def render_by_pdf(filtered, corrections):
                   disabled=True)
     elif st.button("Save & next →", key="bulk_save_next", type="primary"):
         pending = st.session_state.get('pending_edits', {})
+        # Build correction entries from pending edits
+        edits_to_save = {}
         for k, edit in pending.items():
-            corrections[k] = {
+            entry = {
                 'pct_of_parity': edit['pct_of_parity'],
                 'original_pct': edit['original_pct'],
                 'pct_footnote': edit.get('pct_footnote', ''),
@@ -737,12 +750,16 @@ def render_by_pdf(filtered, corrections):
                 'date': edit['date'],
                 'note': edit.get('note', ''),
             }
-        save_corrections(corrections)
+            corrections[k] = entry
+            edits_to_save[k] = entry
+        # Write only these edits to the sheet (not the full dict)
+        save_corrections(corrections, pending_edits=edits_to_save)
         # Release lock on completed PDF
         if reviewer_name:
             release_lock(current_pdf, reviewer_name)
             st.session_state.locked_pdf = None
         st.session_state.pending_edits = {}
+        # Reload from sheet to pick up other reviewers' work
         st.session_state.corrections = load_corrections()
         if st.session_state.pdf_idx < len(pdfs) - 1:
             st.session_state.pdf_idx += 1
