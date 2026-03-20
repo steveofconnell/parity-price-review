@@ -938,7 +938,7 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
             with c_flag:
                 is_flagged = current_status == 'flagged'
                 flagged = st.checkbox(
-                    "Flag",
+                    "Flag — unsure / needs further review",
                     value=is_flagged,
                     key=f"{prefix}_flag_{key}_{row_idx}",
                 )
@@ -946,17 +946,16 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
             with c_note:
                 existing_note = existing.get('note', '')
                 has_note = st.checkbox(
-                    "Note",
+                    "Note (if corrected: describe OCR error)",
                     value=bool(existing_note),
                     key=f"{prefix}_hasnote_{key}_{row_idx}",
                 )
                 new_note = ''
                 if has_note:
                     new_note = st.text_input(
-                        "Note text",
+                        "e.g., 'true . detected as 3'",
                         value=existing_note,
                         key=f"{prefix}_note_{key}_{row_idx}",
-                        label_visibility="collapsed",
                     )
 
             # Determine status from user actions
