@@ -16,7 +16,7 @@ If images are missing, the app will generate them on-the-fly (slower).
 import io
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -40,6 +40,10 @@ GSHEET_HEADERS = ['key', 'source_pdf', 'commodity', 'date',
                   'pct_of_parity', 'original_pct', 'pct_footnote',
                   'parity_price', 'original_parity_price', 'parity_footnote',
                   'status', 'note', 'reviewer', 'timestamp']
+
+# Lock expiry in minutes — if a reviewer hasn't saved within this window,
+# the lock is treated as stale and other reviewers can claim the PDF.
+LOCK_EXPIRY_MINUTES = 30
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +161,146 @@ def save_corrections_to_gsheet(ws, corrections, reviewer=''):
         ws.append_rows(appends, value_input_option='RAW')
 
     return len(updates), len(appends)
+
+
+# ---------------------------------------------------------------------------
+# PDF locking — prevents two reviewers from working on the same page
+# ---------------------------------------------------------------------------
+
+def get_locks_worksheet():
+    """Return the 'locks' worksheet, creating it if needed."""
+    if 'locks_ws' in st.session_state:
+        return st.session_state.locks_ws
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        if 'gcp_service_account' not in st.secrets:
+            return None
+        creds = Credentials.from_service_account_info(
+            dict(st.secrets['gcp_service_account']),
+            scopes=['https://www.googleapis.com/auth/spreadsheets']
+        )
+        gc = gspread.authorize(creds)
+        sheet = gc.open_by_key(GSHEET_ID)
+        # Try to get existing 'locks' worksheet
+        try:
+            ws = sheet.worksheet('locks')
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title='locks', rows=1000, cols=3)
+            ws.update('A1:C1', [['pdf_name', 'reviewer', 'timestamp']])
+        st.session_state.locks_ws = ws
+        return ws
+    except Exception as e:
+        st.sidebar.warning(f"Locks sheet unavailable: {e}")
+        return None
+
+
+def get_locked_pdfs(exclude_reviewer=''):
+    """Return a set of PDF names currently locked by OTHER reviewers.
+
+    Locks older than LOCK_EXPIRY_MINUTES are ignored (treated as stale).
+    """
+    ws = get_locks_worksheet()
+    if not ws:
+        return set()
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return set()
+    now = datetime.now(timezone.utc)
+    locked = set()
+    for row in records:
+        pdf = row.get('pdf_name', '')
+        reviewer = row.get('reviewer', '')
+        ts_str = row.get('timestamp', '')
+        if not pdf or not ts_str:
+            continue
+        # Skip own locks
+        if reviewer == exclude_reviewer:
+            continue
+        # Check expiry
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            age_minutes = (now - ts).total_seconds() / 60
+            if age_minutes > LOCK_EXPIRY_MINUTES:
+                continue  # stale lock
+        except (ValueError, TypeError):
+            continue
+        locked.add(pdf)
+    return locked
+
+
+def acquire_lock(pdf_name, reviewer):
+    """Write or refresh a lock for this PDF. Overwrites any existing lock
+    for the same PDF by this reviewer."""
+    ws = get_locks_worksheet()
+    if not ws or not reviewer:
+        return
+    try:
+        now_str = datetime.now(timezone.utc).isoformat()
+        # Check if this reviewer already has a lock row for this PDF
+        cell_list = ws.findall(pdf_name, in_column=1)
+        for cell in cell_list:
+            row_vals = ws.row_values(cell.row)
+            if len(row_vals) >= 2 and row_vals[1] == reviewer:
+                # Update timestamp
+                ws.update_cell(cell.row, 3, now_str)
+                return
+        # No existing lock — append
+        ws.append_row([pdf_name, reviewer, now_str], value_input_option='RAW')
+    except Exception as e:
+        st.sidebar.warning(f"Could not acquire lock: {e}")
+
+
+def release_lock(pdf_name, reviewer):
+    """Remove this reviewer's lock on the given PDF."""
+    ws = get_locks_worksheet()
+    if not ws or not reviewer:
+        return
+    try:
+        cell_list = ws.findall(pdf_name, in_column=1)
+        for cell in cell_list:
+            row_vals = ws.row_values(cell.row)
+            if len(row_vals) >= 2 and row_vals[1] == reviewer:
+                ws.delete_rows(cell.row)
+                return
+    except Exception:
+        pass
+
+
+def cleanup_stale_locks():
+    """Remove all locks older than LOCK_EXPIRY_MINUTES. Called periodically."""
+    ws = get_locks_worksheet()
+    if not ws:
+        return 0
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return 0
+    now = datetime.now(timezone.utc)
+    rows_to_delete = []
+    for i, row in enumerate(records):
+        ts_str = row.get('timestamp', '')
+        if not ts_str:
+            rows_to_delete.append(i + 2)  # +2: 1-indexed + header
+            continue
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if (now - ts).total_seconds() / 60 > LOCK_EXPIRY_MINUTES:
+                rows_to_delete.append(i + 2)
+        except (ValueError, TypeError):
+            rows_to_delete.append(i + 2)
+    # Delete from bottom up to preserve row indices
+    for row_num in sorted(rows_to_delete, reverse=True):
+        try:
+            ws.delete_rows(row_num)
+        except Exception:
+            pass
+    return len(rows_to_delete)
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +479,9 @@ def main():
         "Your name (for attribution)",
         value=st.session_state.get('reviewer_name', ''),
     )
+    if not st.session_state.get('reviewer_name'):
+        st.sidebar.warning("Enter your name to enable locking — "
+                           "without it, others may review the same pages.")
 
     st.sidebar.header("Filters")
 
@@ -375,6 +522,18 @@ def main():
         mask = mask & df.apply(lambda r: make_key(r) in reviewed_keys, axis=1)
 
     filtered = df[mask].copy()
+
+    # ---- Exclude PDFs locked by other reviewers ----
+    reviewer_name = st.session_state.get('reviewer_name', '')
+    locked_pdfs = get_locked_pdfs(exclude_reviewer=reviewer_name)
+    if locked_pdfs and review_status == "Unreviewed only":
+        pre_lock_count = len(filtered)
+        filtered = filtered[~filtered['source_pdf'].isin(locked_pdfs)]
+        n_skipped = pre_lock_count - len(filtered)
+        if n_skipped > 0:
+            st.sidebar.info(
+                f"Skipping {len(locked_pdfs)} PDF(s) locked by other reviewers"
+            )
 
     # ---- Stats ----
     total = len(df)
@@ -454,6 +613,24 @@ def main():
         if s in status_counts:
             st.sidebar.markdown(f"- {s}: {status_counts[s]}")
 
+    # ---- Lock status ----
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**Active locks:**")
+    all_locks = get_locked_pdfs(exclude_reviewer='')  # show all
+    if all_locks:
+        st.sidebar.markdown(f"{len(all_locks)} PDF(s) currently locked")
+        if st.sidebar.button("Clean up stale locks"):
+            n = cleanup_stale_locks()
+            if n:
+                st.sidebar.success(f"Removed {n} stale lock(s)")
+                # Clear cached worksheet so fresh data is fetched
+                st.session_state.pop('locks_ws', None)
+                st.rerun()
+            else:
+                st.sidebar.info("No stale locks found")
+    else:
+        st.sidebar.markdown("None")
+
     # ---- Main content ----
     if len(filtered) == 0:
         st.info("No items match current filters.")
@@ -494,6 +671,17 @@ def render_by_pdf(filtered, corrections):
             st.rerun()
 
     current_pdf = pdfs[st.session_state.pdf_idx]
+
+    # Acquire lock on this PDF so other reviewers skip it
+    reviewer_name = st.session_state.get('reviewer_name', '')
+    if reviewer_name:
+        # Release previous lock if we navigated away
+        prev_pdf = st.session_state.get('locked_pdf', None)
+        if prev_pdf and prev_pdf != current_pdf:
+            release_lock(prev_pdf, reviewer_name)
+        acquire_lock(current_pdf, reviewer_name)
+        st.session_state.locked_pdf = current_pdf
+
     pdf_data = filtered[filtered['source_pdf'] == current_pdf]
     # Sort by vertical position on page (order they appear in the PDF)
     if 'bbox_top' in pdf_data.columns and pdf_data['bbox_top'].notna().any():
@@ -534,6 +722,11 @@ def render_by_pdf(filtered, corrections):
                 'note': edit.get('note', ''),
             }
         save_corrections(corrections)
+        # Release lock on completed PDF
+        reviewer_name = st.session_state.get('reviewer_name', '')
+        if reviewer_name:
+            release_lock(current_pdf, reviewer_name)
+            st.session_state.locked_pdf = None
         st.session_state.pending_edits = {}
         st.session_state.corrections = load_corrections()
         if st.session_state.pdf_idx < len(pdfs) - 1:
