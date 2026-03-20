@@ -480,8 +480,7 @@ def main():
         value=st.session_state.get('reviewer_name', ''),
     )
     if not st.session_state.get('reviewer_name'):
-        st.sidebar.warning("Enter your name to enable locking — "
-                           "without it, others may review the same pages.")
+        st.sidebar.error("Enter your name above to begin reviewing.")
 
     st.sidebar.header("Filters")
 
@@ -506,34 +505,42 @@ def main():
     )
 
     review_status = st.sidebar.radio(
-        "Show", ["Unreviewed only", "All", "Reviewed only"]
+        "Show", ["Next available", "My reviewed"]
     )
 
     # ---- Apply filters ----
+    reviewer_name = st.session_state.get('reviewer_name', '')
     mask = df['confidence'].isin(conf_filter) & df['commodity'].isin(commodity_filter)
     if report_month_only:
         mask = mask & (df['is_report_month'] == True)
 
+    # Build sets for filtering
     reviewed_keys = {k for k, v in corrections.items()
                      if v.get('status') in ('confirmed', 'corrected', 'rejected', 'flagged')}
-    if review_status == "Unreviewed only":
+    my_reviewed_keys = {k for k, v in corrections.items()
+                        if v.get('status') in ('confirmed', 'corrected', 'rejected', 'flagged')
+                        and v.get('reviewer', '') == reviewer_name} if reviewer_name else set()
+
+    if review_status == "Next available":
+        # Exclude anything already reviewed by anyone
         mask = mask & ~df.apply(lambda r: make_key(r) in reviewed_keys, axis=1)
-    elif review_status == "Reviewed only":
-        mask = mask & df.apply(lambda r: make_key(r) in reviewed_keys, axis=1)
+    elif review_status == "My reviewed":
+        # Show only rows this reviewer has submitted — no lock filtering
+        mask = mask & df.apply(lambda r: make_key(r) in my_reviewed_keys, axis=1)
 
     filtered = df[mask].copy()
 
-    # ---- Exclude PDFs locked by other reviewers ----
-    reviewer_name = st.session_state.get('reviewer_name', '')
-    locked_pdfs = get_locked_pdfs(exclude_reviewer=reviewer_name)
-    if locked_pdfs and review_status == "Unreviewed only":
-        pre_lock_count = len(filtered)
-        filtered = filtered[~filtered['source_pdf'].isin(locked_pdfs)]
-        n_skipped = pre_lock_count - len(filtered)
-        if n_skipped > 0:
-            st.sidebar.info(
-                f"Skipping {len(locked_pdfs)} PDF(s) locked by other reviewers"
-            )
+    # ---- Exclude PDFs locked by other reviewers (only in "Next available") ----
+    if review_status == "Next available":
+        locked_pdfs = get_locked_pdfs(exclude_reviewer=reviewer_name)
+        if locked_pdfs:
+            pre_lock_count = len(filtered)
+            filtered = filtered[~filtered['source_pdf'].isin(locked_pdfs)]
+            n_skipped = pre_lock_count - len(filtered)
+            if n_skipped > 0:
+                st.sidebar.info(
+                    f"Skipping {len(locked_pdfs)} PDF(s) locked by other reviewers"
+                )
 
     # ---- Stats ----
     total = len(df)
@@ -632,6 +639,10 @@ def main():
         st.sidebar.markdown("None")
 
     # ---- Main content ----
+    if not reviewer_name:
+        st.info("Please enter your name in the sidebar to begin reviewing.")
+        return
+
     if len(filtered) == 0:
         st.info("No items match current filters.")
         return
@@ -705,7 +716,12 @@ def render_by_pdf(filtered, corrections):
 
     # Save button
     st.divider()
-    if st.button("Save & next →", key="bulk_save_next", type="primary"):
+    reviewer_name = st.session_state.get('reviewer_name', '')
+    if not reviewer_name:
+        st.warning("Enter your name in the sidebar before submitting.")
+        st.button("Save & next →", key="bulk_save_next", type="primary",
+                  disabled=True)
+    elif st.button("Save & next →", key="bulk_save_next", type="primary"):
         pending = st.session_state.get('pending_edits', {})
         for k, edit in pending.items():
             corrections[k] = {
@@ -723,7 +739,6 @@ def render_by_pdf(filtered, corrections):
             }
         save_corrections(corrections)
         # Release lock on completed PDF
-        reviewer_name = st.session_state.get('reviewer_name', '')
         if reviewer_name:
             release_lock(current_pdf, reviewer_name)
             st.session_state.locked_pdf = None
