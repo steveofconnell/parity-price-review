@@ -113,24 +113,44 @@ def load_corrections_from_gsheet(ws):
 def save_pending_to_gsheet(ws, pending_edits, reviewer=''):
     """Write only the pending edits to Google Sheet. Does not touch other rows.
 
-    This avoids race conditions: each reviewer writes only the rows they
-    just reviewed, rather than overwriting the entire sheet.
+    Before writing, checks each row: if it already exists in the sheet
+    and was reviewed by a DIFFERENT reviewer, that row is skipped to
+    prevent overwriting another reviewer's work.
     """
     if not pending_edits:
         return 0, 0
 
-    # Get existing keys and their row numbers
-    existing = ws.col_values(1)  # column A = keys
-    key_to_row = {k: i + 1 for i, k in enumerate(existing) if k}
+    # Get all existing data to check for conflicts
+    all_rows = ws.get_all_values()
+    key_to_row = {}       # key -> row number (1-indexed)
+    key_to_reviewer = {}  # key -> existing reviewer name
+    for i, row_vals in enumerate(all_rows):
+        if i == 0:
+            continue  # skip header
+        if row_vals:
+            k = row_vals[0]
+            key_to_row[k] = i + 1
+            # Reviewer is column 13 (index 12)
+            if len(row_vals) > 12:
+                key_to_reviewer[k] = row_vals[12]
 
     timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     updates = []
     appends = []
+    skipped = 0
 
     for key, c in pending_edits.items():
         if c.get('status', 'unreviewed') == 'unreviewed':
             continue
+
+        # Skip rows already reviewed by someone else
+        if key in key_to_reviewer:
+            existing_reviewer = key_to_reviewer[key]
+            if existing_reviewer and existing_reviewer != reviewer:
+                skipped += 1
+                continue
+
         row_data = [
             key,
             c.get('source_pdf', ''),
@@ -164,6 +184,9 @@ def save_pending_to_gsheet(ws, pending_edits, reviewer=''):
 
     if appends:
         ws.append_rows(appends, value_input_option='RAW')
+
+    if skipped:
+        st.sidebar.info(f"Skipped {skipped} row(s) already reviewed by others")
 
     return len(updates), len(appends)
 
