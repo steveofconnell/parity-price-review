@@ -577,16 +577,35 @@ def main():
 
     filtered = df[mask].copy()
 
-    # ---- Exclude PDFs locked by other reviewers (only in "Next available") ----
+    # ---- Exclude pages locked by other reviewers (only in "Next available") ----
     if review_status == "Next available":
-        locked_pdfs = get_locked_pdfs(exclude_reviewer=reviewer_name)
-        if locked_pdfs:
+        locked_keys = get_locked_pdfs(exclude_reviewer=reviewer_name)
+        if locked_keys:
+            # Lock keys are either "pdf.pdf" (legacy) or "pdf.pdf:pN" (new).
+            # Build sets for both formats to handle transition period.
+            locked_pdf_only = set()
+            locked_pdf_page = set()
+            for lk in locked_keys:
+                if ':p' in lk:
+                    pdf_part, page_part = lk.rsplit(':p', 1)
+                    locked_pdf_page.add((pdf_part, int(page_part)))
+                else:
+                    locked_pdf_only.add(lk)
+
             pre_lock_count = len(filtered)
-            filtered = filtered[~filtered['source_pdf'].isin(locked_pdfs)]
+
+            def is_locked(row):
+                if row['source_pdf'] in locked_pdf_only:
+                    return True
+                if (row['source_pdf'], int(row['source_page'])) in locked_pdf_page:
+                    return True
+                return False
+
+            filtered = filtered[~filtered.apply(is_locked, axis=1)]
             n_skipped = pre_lock_count - len(filtered)
             if n_skipped > 0:
                 st.sidebar.info(
-                    f"Skipping {len(locked_pdfs)} PDF(s) locked by other reviewers"
+                    f"Skipping {len(locked_keys)} page(s) locked by other reviewers"
                 )
 
     # ---- Stats ----
@@ -701,52 +720,75 @@ def main():
 
 
 def render_by_pdf(filtered, corrections):
-    """Show one PDF at a time with all its commodity extractions."""
-    pdfs = sorted(filtered['source_pdf'].unique())
+    """Show one PDF page at a time with all its commodity extractions.
+
+    Groups by (source_pdf, source_page) so that HathiTrust bound volumes
+    (many parity tables per PDF) are navigated page-by-page, not as one
+    giant block.
+    """
+    # Build list of unique (pdf, page) pairs as the navigation units
+    page_units = (
+        filtered[['source_pdf', 'source_page']]
+        .drop_duplicates()
+        .sort_values(['source_pdf', 'source_page'])
+        .reset_index(drop=True)
+    )
+    page_unit_list = list(page_units.itertuples(index=False, name=None))
+
+    def format_unit(i):
+        pdf, pg = page_unit_list[i]
+        return f"[{i+1}/{len(page_unit_list)}] {pdf} p{int(pg)}"
 
     # Navigation
     col_nav1, col_nav2, col_nav3 = st.columns([1, 3, 1])
     if 'pdf_idx' not in st.session_state:
         st.session_state.pdf_idx = 0
+    # Clamp index to valid range
+    st.session_state.pdf_idx = min(st.session_state.pdf_idx,
+                                   len(page_unit_list) - 1)
     with col_nav1:
         if st.button("← Previous") and st.session_state.pdf_idx > 0:
             st.session_state.pdf_idx -= 1
             st.rerun()
     with col_nav3:
-        if st.button("Next →") and st.session_state.pdf_idx < len(pdfs) - 1:
+        if st.button("Next →") and st.session_state.pdf_idx < len(page_unit_list) - 1:
             st.session_state.pdf_idx += 1
             st.rerun()
     with col_nav2:
         idx = st.selectbox(
             "PDF",
-            range(len(pdfs)),
-            index=min(st.session_state.pdf_idx, len(pdfs) - 1),
-            format_func=lambda i: f"[{i+1}/{len(pdfs)}] {pdfs[i]}",
+            range(len(page_unit_list)),
+            index=st.session_state.pdf_idx,
+            format_func=format_unit,
             label_visibility="collapsed",
         )
         if idx != st.session_state.pdf_idx:
             st.session_state.pdf_idx = idx
             st.rerun()
 
-    current_pdf = pdfs[st.session_state.pdf_idx]
+    current_pdf, page_num = page_unit_list[st.session_state.pdf_idx]
+    page_num = int(page_num)
 
-    # Acquire lock on this PDF so other reviewers skip it
+    # Acquire lock on this PDF+page so other reviewers skip it
+    lock_key = f"{current_pdf}:p{page_num}"
     reviewer_name = st.session_state.get('reviewer_name', '')
     if reviewer_name:
         # Release previous lock if we navigated away
-        prev_pdf = st.session_state.get('locked_pdf', None)
-        if prev_pdf and prev_pdf != current_pdf:
-            release_lock(prev_pdf, reviewer_name)
-        acquire_lock(current_pdf, reviewer_name)
-        st.session_state.locked_pdf = current_pdf
+        prev_lock = st.session_state.get('locked_pdf', None)
+        if prev_lock and prev_lock != lock_key:
+            release_lock(prev_lock, reviewer_name)
+        acquire_lock(lock_key, reviewer_name)
+        st.session_state.locked_pdf = lock_key
 
-    pdf_data = filtered[filtered['source_pdf'] == current_pdf]
+    pdf_data = filtered[
+        (filtered['source_pdf'] == current_pdf) &
+        (filtered['source_page'] == page_num)
+    ]
     # Sort by vertical position on page (order they appear in the PDF)
     if 'bbox_top' in pdf_data.columns and pdf_data['bbox_top'].notna().any():
         pdf_data = pdf_data.sort_values('bbox_top')
     else:
         pdf_data = pdf_data.sort_values('commodity')
-    page_num = pdf_data['source_page'].iloc[0]
 
     # Fetch page image from GCS
     page_img = get_page_image(current_pdf, page_num)
@@ -801,14 +843,14 @@ def render_by_pdf(filtered, corrections):
             edits_to_save[k] = entry
         # Write only these edits to the sheet (not the full dict)
         save_corrections(corrections, pending_edits=edits_to_save)
-        # Release lock on completed PDF
+        # Release lock on completed page
         if reviewer_name:
-            release_lock(current_pdf, reviewer_name)
+            release_lock(lock_key, reviewer_name)
             st.session_state.locked_pdf = None
         st.session_state.pending_edits = {}
         # Reload from sheet to pick up other reviewers' work
         st.session_state.corrections = load_corrections()
-        if st.session_state.pdf_idx < len(pdfs) - 1:
+        if st.session_state.pdf_idx < len(page_unit_list) - 1:
             st.session_state.pdf_idx += 1
         st.rerun()
 
