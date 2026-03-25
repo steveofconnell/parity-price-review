@@ -859,8 +859,12 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
                         ct = max(0, row_top - 250)
                         cb = min(page_img.height, row_bottom + 100)
                         crop = page_img.crop((0, ct, page_img.width, cb))
-                        draw = ImageDraw.Draw(crop)
                         crop_h = cb - ct
+
+                        # Semi-transparent overlay for guides and highlight
+                        overlay = Image.new('RGBA', crop.size, (0, 0, 0, 0))
+                        odraw = ImageDraw.Draw(overlay)
+                        guide_color = (230, 57, 70, 100)  # #e63946 at ~40% opacity
 
                         if col_positions:
                             col_dpi = col_positions.get('dpi', 400)
@@ -872,15 +876,19 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
                                          pct_ranges[-1][0], pct_ranges[-1][1]]
                                 for x in edges:
                                     cx = int(x * col_scale)
-                                    draw.line([(cx, 0), (cx, crop_h)],
-                                              fill='#e63946', width=3)
+                                    odraw.line([(cx, 0), (cx, crop_h)],
+                                               fill=guide_color, width=3)
 
                         hl_top = row_top - ct - 2
                         hl_bottom = row_bottom - ct + 2
-                        draw.rectangle(
+                        odraw.rectangle(
                             [0, hl_top, crop.width, hl_bottom],
-                            outline='#e63946', width=3
+                            outline=guide_color, width=3
                         )
+
+                        crop = crop.convert('RGBA')
+                        crop = Image.alpha_composite(crop, overlay)
+                        crop = crop.convert('RGB')
                         st.image(crop)
                     except Exception as e:
                         st.warning(f"Crop error: {e}")
