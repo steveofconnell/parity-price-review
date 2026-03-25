@@ -405,16 +405,29 @@ def make_key(row):
 # Image handling
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=3600)
 def fetch_image_from_gcs(image_name):
-    """Fetch a page image from Google Cloud Storage. Returns PIL Image or None."""
+    """Fetch a page image from Google Cloud Storage. Returns PIL Image or None.
+
+    Uses session_state as a cache (keyed by image_name) so that successful
+    fetches are reused across reruns within the same session, but failures
+    are retried on every rerun rather than being cached for an hour.
+    """
+    cache_key = f"_img_cache_{image_name}"
+    if cache_key in st.session_state:
+        return st.session_state[cache_key]
+
     url = f"{GCS_IMAGE_BASE}/{image_name}"
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=15)
         if resp.status_code == 200:
-            return Image.open(io.BytesIO(resp.content))
-    except Exception:
-        pass
+            img = Image.open(io.BytesIO(resp.content))
+            st.session_state[cache_key] = img
+            return img
+        else:
+            st.warning(f"Image fetch returned HTTP {resp.status_code} for {image_name}")
+    except Exception as e:
+        st.warning(f"Image fetch failed for {image_name}: {e}")
+    # Do NOT cache failures — return None and retry on next rerun
     return None
 
 
@@ -737,6 +750,17 @@ def render_by_pdf(filtered, corrections):
 
     # Fetch page image from GCS
     page_img = get_page_image(current_pdf, page_num)
+
+    if page_img is None:
+        st.warning(
+            f"Could not load page image for {current_pdf} (page {int(page_num)}). "
+            "The image server may be temporarily unavailable."
+        )
+        if st.button("Retry image load", key="retry_img"):
+            # Clear any cached failure and rerun
+            cache_key = f"_img_cache_{current_pdf}_p{int(page_num)}.jpg"
+            st.session_state.pop(cache_key, None)
+            st.rerun()
 
     st.caption(f"{len(pdf_data)} commodities extracted")
 
