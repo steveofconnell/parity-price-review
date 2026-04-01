@@ -437,6 +437,43 @@ def get_page_image(pdf_filename, page_number):
     return fetch_image_from_gcs(image_name)
 
 
+def infer_column_index(data_date, source_pdf):
+    """Infer which of the 3 table columns (0, 1, 2) a row came from.
+
+    USDA Agricultural Prices PDFs have 3 data columns:
+        col 0 = same month last year
+        col 1 = previous month
+        col 2 = report month (current)
+
+    Returns 0, 1, or 2 based on the relationship between the data date
+    and the PDF's report date (extracted from filename).
+    """
+    import re
+    try:
+        data_year = int(data_date[:4])
+        data_month = int(data_date[5:7])
+        # Extract report date from PDF filename: AgriPric-MM-DD-YYYY.pdf
+        m = re.match(r'AgriPric-(\d{2})-\d{2}-(\d{4})', source_pdf)
+        if not m:
+            return 2  # non-AgriPric PDFs (HathiTrust) — default to last column
+        pdf_month = int(m.group(1))
+        pdf_year = int(m.group(2))
+
+        # Compute months difference: pdf_report_date - data_date
+        diff = (pdf_year * 12 + pdf_month) - (data_year * 12 + data_month)
+
+        if diff == 0:
+            return 2  # report month (data month == PDF month)
+        elif diff == 1:
+            return 1  # previous month column
+        elif diff >= 11 and diff <= 13:
+            return 0  # same month last year column
+        else:
+            return 2  # fallback for unusual offsets
+    except (ValueError, TypeError):
+        return 2  # fallback
+
+
 def get_highlighted_image(page_img, rows_df):
     """Return a PIL Image with bounding boxes drawn around extracted rows."""
     img = page_img.copy()
@@ -942,8 +979,17 @@ def render_commodity_forms(data, corrections, prefix="", page_img=None,
                             pct_ranges = col_positions.get('pct_x_ranges', [])
                             par_ranges = col_positions.get('parity_x_ranges', [])
                             if pct_ranges and par_ranges:
-                                edges = [par_ranges[-1][0], par_ranges[-1][1],
-                                         pct_ranges[-1][0], pct_ranges[-1][1]]
+                                # Determine which column this row came from
+                                col_idx = infer_column_index(
+                                    str(row.get('date', '')),
+                                    str(row.get('source_pdf', ''))
+                                )
+                                # Clamp to available columns
+                                col_idx = min(col_idx, len(pct_ranges) - 1)
+                                edges = [par_ranges[col_idx][0],
+                                         par_ranges[col_idx][1],
+                                         pct_ranges[col_idx][0],
+                                         pct_ranges[col_idx][1]]
                                 for x in edges:
                                     cx = int(x * col_scale)
                                     odraw.line([(cx, 0), (cx, crop_h)],
