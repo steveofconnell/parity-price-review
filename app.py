@@ -546,8 +546,12 @@ def main():
         "Commodity", commodity_options, default=commodity_options
     )
 
+    # Default to showing all rows if the data contains review_computed rows
+    # (non-report-month batch), otherwise default to report-month only
+    has_review_computed = 'review_computed' in df['confidence'].values
     report_month_only = st.sidebar.checkbox(
-        "Report-month rows only", value=True,
+        "Report-month rows only",
+        value=not has_review_computed,
         help="Show only the current-month value from each report (most reliable)"
     )
 
